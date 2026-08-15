@@ -8,8 +8,52 @@
 
 const CONFIG = {
   TELEGRAM_TOKEN: "YOUR_TELEGRAM_BOT_TOKEN", // ⚠️ 请填入你的 Telegram 机器人 Token
-  OWNER_ID: 0                                // ⚠️ 请填入所有者(管理员)的数字 ID
+  OWNER_ID: 0,                               // ⚠️ 请填入所有者(管理员)的数字 ID
+
+  // 密码加盐用的固定盐值，建议改成你自己的随机字符串（越长越好）
+  PASSWORD_SALT: "CHANGE_ME_RANDOM_SALT_pgkj666"
 };
+
+// ============================================================================
+// 密码安全：SHA-256 + 盐 哈希（Cloudflare Workers 原生支持 Web Crypto）
+// ----------------------------------------------------------------------------
+// 说明：密码不再明文存储，只存哈希值。所有者面板也无法再看到原始密码。
+// 为兼容历史明文数据，登录时若发现旧的明文密码会自动升级为哈希。
+// ============================================================================
+
+async function hashPassword(password) {
+  const data = new TextEncoder().encode(`${CONFIG.PASSWORD_SALT}::${password}`);
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  return "sha256$" + [...new Uint8Array(digest)]
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+// 校验密码：优先按哈希比对；若存储的是旧明文则直接比对（用于平滑迁移）
+async function verifyPassword(inputPassword, storedValue) {
+  if (typeof storedValue !== "string") return false;
+  if (storedValue.startsWith("sha256$")) {
+    const inputHash = await hashPassword(inputPassword);
+    return timingSafeEqual(inputHash, storedValue);
+  }
+  // 旧的明文密码
+  return timingSafeEqual(inputPassword, storedValue);
+}
+
+// 判断存储值是否为旧明文（用于登录成功后自动升级）
+function isLegacyPlain(storedValue) {
+  return typeof storedValue === "string" && !storedValue.startsWith("sha256$");
+}
+
+// 定长时间比较，降低时序攻击风险
+function timingSafeEqual(a, b) {
+  if (a.length !== b.length) return false;
+  let result = 0;
+  for (let i = 0; i < a.length; i++) {
+    result |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return result === 0;
+}
 
 addEventListener("fetch", (event) => {
   event.respondWith(handleRequest(event.request));
@@ -230,7 +274,8 @@ async function handlePrivateMessage(msg) {
       const username = userState.targetUsername;
       const password = text;
 
-      const userObj = { username, password, approved: true };
+      const passwordHash = await hashPassword(password);
+      const userObj = { username, password: passwordHash, approved: true };
       await setKV(`user_uname_${username}`, userObj);
 
       let allUsers = (await getKV("all_users_list")) || [];
@@ -242,6 +287,29 @@ async function handlePrivateMessage(msg) {
       return sendTelegram("sendMessage", {
         chat_id: chatId,
         text: `✅ 用户 **${username}** 已成功创建！`,
+        reply_markup: {
+          inline_keyboard: [[{ text: "🔙 返回菜单", callback_data: "admin_users_menu" }]]
+        }
+      });
+    }
+
+    if (userState.step === "RESET_USER_PASSWORD") {
+      const targetUser = userState.targetUsername;
+      const userData = await getKV(`user_uname_${targetUser}`);
+      if (!userData) {
+        await setKV(`state_${userId}`, null);
+        return sendTelegram("sendMessage", {
+          chat_id: chatId,
+          text: `❌ 未找到用户 ${targetUser}。`
+        });
+      }
+      userData.password = await hashPassword(text);
+      await setKV(`user_uname_${targetUser}`, userData);
+      await setKV(`state_${userId}`, null);
+      return sendTelegram("sendMessage", {
+        chat_id: chatId,
+        text: `✅ 用户 **${targetUser}** 的密码已重置（已加密存储）。`,
+        parse_mode: "Markdown",
         reply_markup: {
           inline_keyboard: [[{ text: "🔙 返回菜单", callback_data: "admin_users_menu" }]]
         }
@@ -263,7 +331,8 @@ async function handlePrivateMessage(msg) {
       const password = text;
 
       let requests = (await getKV("pending_requests")) || [];
-      requests.push({ userId, username, password });
+      // 注册申请里就存哈希，避免明文密码在待审列表中停留
+      requests.push({ userId, username, password: await hashPassword(password) });
       await setKV("pending_requests", requests);
 
       await setKV(`state_${userId}`, null);
@@ -287,7 +356,12 @@ async function handlePrivateMessage(msg) {
       const password = text;
 
       const userData = await getKV(`user_uname_${username}`);
-      if (userData && userData.password === password && userData.approved) {
+      if (userData && userData.approved && (await verifyPassword(password, userData.password))) {
+        // 若旧数据是明文密码，登录成功后自动升级为哈希
+        if (isLegacyPlain(userData.password)) {
+          userData.password = await hashPassword(password);
+          await setKV(`user_uname_${username}`, userData);
+        }
         await setKV(`session_${userId}`, username);
         await setKV(`state_${userId}`, null);
         return showUserDashboard(chatId, username);
@@ -311,6 +385,34 @@ async function handlePrivateMessage(msg) {
         text: "✅ Gemini API 密钥已成功登记并启用！",
         reply_markup: {
           inline_keyboard: [[{ text: "🔙 返回面板", callback_data: "user_dashboard" }]]
+        }
+      });
+    }
+
+    // 频道级独立 API：为指定频道单独绑定一个 Gemini 密钥
+    if (userState.step === "SET_CHANNEL_API") {
+      const targetChannelId = userState.targetChannelId;
+      let userChannels = (await getKV(`channels_${userId}`)) || [];
+      const channel = userChannels.find((c) => c.id.toString() === targetChannelId.toString());
+
+      if (!channel) {
+        await setKV(`state_${userId}`, null);
+        return sendTelegram("sendMessage", {
+          chat_id: chatId,
+          text: "❌ 未找到该频道，可能已被移除。"
+        });
+      }
+
+      channel.api = text.trim();
+      await setKV(`channels_${userId}`, userChannels);
+      await setKV(`state_${userId}`, null);
+
+      return sendTelegram("sendMessage", {
+        chat_id: chatId,
+        text: `✅ 已为频道 **${channel.title}** 绑定专属 API 密钥！\n该频道的翻译将优先使用此密钥。`,
+        parse_mode: "Markdown",
+        reply_markup: {
+          inline_keyboard: [[{ text: "🔙 返回频道设置", callback_data: `manage_ch_${channel.id}` }]]
         }
       });
     }
@@ -474,18 +576,23 @@ async function handleCallbackQuery(query) {
     const targetUser = data.replace("view_u_", "");
     const keyboard = {
       inline_keyboard: [
-        [{ text: "👁 查看用户名和密码", callback_data: `show_pass_${targetUser}` }],
+        [{ text: "🔒 重置该用户密码", callback_data: `reset_pass_${targetUser}` }],
         [{ text: "❌ 删除用户", callback_data: `del_u_${targetUser}` }],
         [{ text: "🔙 返回上一级", callback_data: "admin_list_users" }]
       ]
     };
-    return editOrSend(chatId, messageId, `👤 **用户信息：** ${targetUser}`, keyboard);
+    return editOrSend(chatId, messageId, `👤 **用户信息：** ${targetUser}\n\n🔐 密码已加密存储，无法查看明文。如遗忘可点击「重置密码」。`, keyboard);
   }
 
-  if (data.startsWith("show_pass_") && userId === CONFIG.OWNER_ID) {
-    const targetUser = data.replace("show_pass_", "");
-    const userData = await getKV(`user_uname_${targetUser}`);
-    return answerCallback(queryId, `👤 用户名: ${userData.username}\n🔑 密码: ${userData.password}`, true);
+  if (data.startsWith("reset_pass_") && userId === CONFIG.OWNER_ID) {
+    const targetUser = data.replace("reset_pass_", "");
+    await setKV(`state_${userId}`, { step: "RESET_USER_PASSWORD", targetUsername: targetUser });
+    await answerCallback(queryId, "请发送新密码。");
+    return sendTelegram("sendMessage", {
+      chat_id: chatId,
+      text: `🔒 请发送用户 **${targetUser}** 的新密码：`,
+      parse_mode: "Markdown"
+    });
   }
 
   if (data.startsWith("del_u_") && userId === CONFIG.OWNER_ID) {
@@ -634,20 +741,60 @@ async function handleCallbackQuery(query) {
 
     if (!channel) return answerCallback(queryId, "未找到该频道。", true);
 
-    const keyboard = {
-      inline_keyboard: [
-        [{ text: "🔑 连接 / 更换该频道的 API", callback_data: `set_ch_api_${channel.id}` }],
-        [{ text: "🔙 返回频道列表", callback_data: "user_channels_menu" }]
-      ]
-    };
+    const rows = [
+      [{ text: "🔑 连接 / 更换该频道的 API", callback_data: `set_ch_api_${channel.id}` }]
+    ];
+    if (channel.api) {
+      rows.push([{ text: "❌ 移除该频道的专属 API", callback_data: `del_ch_api_${channel.id}` }]);
+    }
+    rows.push([{ text: "🔙 返回频道列表", callback_data: "user_channels_menu" }]);
 
-    const apiStatus = channel.api ? "✅ 已连接" : "❌ 无 API（将使用默认系统）";
+    const apiStatus = channel.api ? "✅ 已绑定专属 API" : "❌ 无专属 API（将使用你账户的默认 API）";
 
     return editOrSend(
       chatId,
       messageId,
       `📢 **频道设置：** ${channel.title}\n\nAPI 状态：${apiStatus}`,
-      keyboard
+      { inline_keyboard: rows }
+    );
+  }
+
+  // 为某频道设置专属 API：进入输入状态
+  if (data.startsWith("set_ch_api_")) {
+    const targetChannelId = data.replace("set_ch_api_", "");
+    const userChannels = (await getKV(`channels_${userId}`)) || [];
+    const channel = userChannels.find((c) => c.id.toString() === targetChannelId);
+    if (!channel) return answerCallback(queryId, "未找到该频道。", true);
+
+    await setKV(`state_${userId}`, { step: "SET_CHANNEL_API", targetChannelId });
+    await answerCallback(queryId, "请发送该频道专属的 API 密钥。");
+    return sendTelegram("sendMessage", {
+      chat_id: chatId,
+      text: `🔑 请发送要绑定到频道 **${channel.title}** 的 Gemini API 密钥：`,
+      parse_mode: "Markdown"
+    });
+  }
+
+  // 移除某频道的专属 API
+  if (data.startsWith("del_ch_api_")) {
+    const targetChannelId = data.replace("del_ch_api_", "");
+    let userChannels = (await getKV(`channels_${userId}`)) || [];
+    const channel = userChannels.find((c) => c.id.toString() === targetChannelId);
+    if (!channel) return answerCallback(queryId, "未找到该频道。", true);
+
+    channel.api = null;
+    await setKV(`channels_${userId}`, userChannels);
+    await answerCallback(queryId, "该频道的专属 API 已移除。", true);
+    return editOrSend(
+      chatId,
+      messageId,
+      `📢 **频道设置：** ${channel.title}\n\nAPI 状态：❌ 无专属 API（将使用你账户的默认 API）`,
+      {
+        inline_keyboard: [
+          [{ text: "🔑 连接 / 更换该频道的 API", callback_data: `set_ch_api_${channel.id}` }],
+          [{ text: "🔙 返回频道列表", callback_data: "user_channels_menu" }]
+        ]
+      }
     );
   }
 
@@ -708,12 +855,18 @@ async function resolveApiKey(query) {
   if (channelId) {
     const ownerId = await getKV(`channel_owner_${channelId}`);
     if (ownerId) {
+      // 1) 优先使用该频道绑定的「专属 API」
+      const ownerChannels = (await getKV(`channels_${ownerId}`)) || [];
+      const ch = ownerChannels.find((c) => c.id === channelId);
+      if (ch && ch.api) return ch.api;
+
+      // 2) 其次使用频道所有者账户的默认 API
       const ownerApis = (await getKV(`apis_${ownerId}`)) || [];
       if (ownerApis.length > 0) return ownerApis[0];
     }
   }
 
-  // 回退到点击者自己的 API
+  // 3) 最后回退到点击者自己的 API
   const clickerApis = (await getKV(`apis_${clickerId}`)) || [];
   return clickerApis.length > 0 ? clickerApis[0] : null;
 }
