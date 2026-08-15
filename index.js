@@ -648,7 +648,7 @@ async function handleCallbackQuery(query) {
     }
   }
 
-  // 拒绝注册请求（原代码缺失，已补上）
+  // 拒绝注册请求
   if (data.startsWith("rej_req_") && userId === CONFIG.OWNER_ID) {
     const idx = parseInt(data.replace("rej_req_", ""));
     let requests = (await getKV("pending_requests")) || [];
